@@ -65,27 +65,77 @@ def lookup(df: pd.DataFrame, column: str, value: float, mode: str):
     if column not in df.columns:
         raise ValueError(f"Column '{column}' not found. Choose from: {list(df.columns)}")
 
+    # numeric version of the selected column
     s = pd.to_numeric(df[column], errors="coerce")
 
-    if mode == "Exact":
-        return df[df[column] == value]
-
     if s.isna().all():
-        raise ValueError(f"Column '{column}' isn't numeric (can't do nearest/bracket).")
+        raise ValueError(f"Column '{column}' isn't numeric.")
+
+    # Exact match always available
+    if mode == "Exact":
+        return df[s == value]
+
+    # For any non-exact modes, sort by the selected column
+    df2 = df.copy()
+    df2["_x"] = s
+    df2 = df2.sort_values("_x").reset_index(drop=True)
+
+    # bounds
+    x_min, x_max = float(df2["_x"].min()), float(df2["_x"].max())
 
     if mode == "Nearest":
-        idx = (s - value).abs().idxmin()
-        return df.loc[[idx]]
+        idx = (df2["_x"] - value).abs().idxmin()
+        return df2.loc[[idx]].drop(columns="_x")
 
     if mode == "Bracket (below + above)":
-        df2 = df.copy()
-        df2["_col"] = s
-        df2 = df2.sort_values("_col")
+        lower = df2[df2["_x"] <= value].tail(1)
+        upper = df2[df2["_x"] >= value].head(1)
+        out = pd.concat([lower, upper]).drop(columns="_x").drop_duplicates()
+        return out
 
-        lower = df2[df2["_col"] <= value].tail(1)
-        upper = df2[df2["_col"] >= value].head(1)
+    if mode == "Interpolated (calculated)":
+        # if out of range, return nearest + warning handled in UI (or clamp here)
+        if value < x_min or value > x_max:
+            idx = (df2["_x"] - value).abs().idxmin()
+            return df2.loc[[idx]].drop(columns="_x")
 
-        out = pd.concat([lower, upper]).drop(columns="_col").drop_duplicates()
+        # exact row exists?
+        exact = df2[df2["_x"] == value]
+        if not exact.empty:
+            return exact.drop(columns="_x")
+
+        # find surrounding rows
+        lower = df2[df2["_x"] < value].tail(1)
+        upper = df2[df2["_x"] > value].head(1)
+
+        # safety
+        if lower.empty or upper.empty:
+            idx = (df2["_x"] - value).abs().idxmin()
+            return df2.loc[[idx]].drop(columns="_x")
+
+        x0 = float(lower["_x"].iloc[0])
+        x1 = float(upper["_x"].iloc[0])
+        t = (value - x0) / (x1 - x0)  # 0..1
+
+        # Build interpolated row
+        row = {}
+        row[column] = value  # keep user input visible
+
+        for c in df.columns:
+            if c == column:
+                continue
+
+            a = pd.to_numeric(lower[c], errors="coerce").iloc[0]
+            b = pd.to_numeric(upper[c], errors="coerce").iloc[0]
+
+            # If either side is NaN (e.g., N20 beyond 100), keep NaN
+            if pd.isna(a) or pd.isna(b):
+                row[c] = None
+            else:
+                row[c] = a + t * (b - a)
+
+        # Return as a single-row dataframe with same column order
+        out = pd.DataFrame([row])[df.columns]
         return out
 
     raise ValueError("Unknown mode")
@@ -109,19 +159,25 @@ with col2:
     numeric_series = pd.to_numeric(df[column], errors="coerce")
     min_v = float(numeric_series.min()) if numeric_series.notna().any() else 0.0
     max_v = float(numeric_series.max()) if numeric_series.notna().any() else 1000.0
-    value = st.number_input("Value", min_value=0.0, value=float(min_v), step=1.0)
+    value = st.number_input("Value", min_value=0.0, value=float(min_v), step=0.1)
 
 with col3:
-    mode = st.radio("Match mode", ["Nearest", "Exact", "Bracket (below + above)"], horizontal=True)
-
+    mode = st.radio(
+        "Match mode",
+        ["Nearest", "Exact", "Bracket (below + above)", "Interpolated (calculated)"],
+        horizontal=True
+    )
 if st.button("Lookup"):
     try:
         result = lookup(df, column, value, mode)
-        if result.empty:
-            st.warning("No exact match found (try Nearest or Bracket).")
+        if result.empty and mode == "Exact":
+            st.warning("No exact match found. Try Nearest or Interpolated.")
+        elif result.empty:
+            st.warning("No result found.")
         else:
             st.success(f"Returned {len(result)} row(s).")
-            st.dataframe(result, use_container_width=True)
+            st.dataframe(result.round(2), use_container_width=True)
+
     except Exception as e:
         st.error(str(e))
 
